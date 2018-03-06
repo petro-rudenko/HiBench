@@ -174,7 +174,13 @@ HiBenchEnvPropMapping=dict(
     STORAGE_LEVEL="hibench.nweight.storage_level",
     DISABLE_KRYO="hibench.nweight.disable_kryo",
     MODEL="hibench.nweight.model",
-
+    # For TPCDS
+    DSDGEN_DIR="hibench.tpcds.dsdgen",
+    TABLE_SIZE="hibench.tpcds.tablesize",
+    HIVE_METASTORE_URIS="hive.metastore.uris",
+    TPCDS_TEST_LIST="hibench.tpcds.test.list",
+    TPCDS_JDBC_URL="hibench.tpcds.jdbc.url",
+    TPCDS_STREAM_SCALE="hibench.tpcds.stream.scale",
     # For streaming bench
     STREAMING_TESTCASE="hibench.streambench.testCase",
     COMMON_JAR="hibench.common.jar",

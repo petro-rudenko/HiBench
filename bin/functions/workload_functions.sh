@@ -135,7 +135,7 @@ function upload_to_hdfs(){
     execute_withlog ${CMD}
 
     # prepare parent folder
-    CMD="$HADOOP_EXECUTABLE --config $HADOOP_CONF_DIR fs -mkdir `dirname $REMOTE_FILE_PATH`"
+    CMD="$HADOOP_EXECUTABLE --config $HADOOP_CONF_DIR fs -mkdir -p `dirname $REMOTE_FILE_PATH`"
     echo -e "${BCyan}hdfs mkdir : ${Cyan}${CMD}${Color_Off}" > /dev/stderr
     execute_withlog ${CMD}
 
@@ -213,7 +213,8 @@ function run_spark_job() {
            YARN_OPTS="${YARN_OPTS} --driver-memory ${SPARK_YARN_DRIVER_MEMORY}"
        fi
     fi
-    if [[ "$CLS" == *.py ]]; then 
+
+    if [[ "$CLS" == *.py ]]; then
         LIB_JARS="$LIB_JARS --jars ${SPARKBENCH_JAR}"
         SUBMIT_CMD="${SPARK_HOME}/bin/spark-submit ${LIB_JARS} --properties-file ${SPARK_PROP_CONF} --master ${SPARK_MASTER} ${YARN_OPTS} ${CLS} $@"
     else
@@ -308,6 +309,26 @@ function ensure_mahout_release (){
     export_withlog HADOOP_CONF_DIR    
 }
 
+function ensure_tpcds_kit_ready (){
+
+    mkdir -p $DSDGEN_DIR
+    TPCDS_KIT_DIR=`cd $DSDGEN_DIR/../; pwd`
+    rm -rf $TPCDS_KIT_DIR
+    execute "git clone https://github.com/davies/tpcds-kit.git $TPCDS_KIT_DIR"
+
+    if [ ! -e "${DSDGEN_DIR}/dsdgen" ]; then
+        mv "${DSDGEN_DIR}/Makefile.suite" "${DSDGEN_DIR}/makefile"
+
+        echo -e "${BCyan}Executing: ${Cyan}make -C ${DSDGEN_DIR} dsdgen${Color_Off}"
+        execute_withlog "make -C ${DSDGEN_DIR} dsdgen"
+
+        if [ ! -e "${DSDGEN_DIR}/dsdgen" ]; then
+            assert 0 "Error: Tpc-DS kit dsdgen is not ready!"
+            exit
+        fi
+    fi
+}
+
 function execute () {
     CMD="$@"
     echo -e "${BCyan}Executing: ${Cyan}${CMD}${Color_Off}"
@@ -339,12 +360,12 @@ function export_withlog () {
 function command_exist ()
 {
     result=$(which $1)
-    if [ $? -eq 0 ] 
+    if [ $? -eq 0 ]
     then
         return 0
     else
         return 1
-    fi  
+    fi
 }
 
 function ensure_nutchindexing_release () {
@@ -447,4 +468,190 @@ CREATE EXTERNAL TABLE uservisits_copy (sourceIP STRING,destURL STRING,visitDate 
 INSERT OVERWRITE TABLE uservisits_copy SELECT * FROM uservisits;
 EOF
 
+}
+
+function ensure_thriftserver_started() {
+    ${START_THRIFTSERVER_CMD} --master ${SPARK_MASTER} ${YARN_OPTS} --properties-file ${SPARK_PROP_CONF}
+    SUBMIT_CMD="${BEELINE_CMD} ${BEELINE_GLOBAL_OPTS} -e RESET"
+    echo -e "${BCyan}Test if Thrift server's been successfully started:${Color_Off}"
+    execute_withlog ${SUBMIT_CMD}
+    result=$?
+    count=0
+    until [ $result -eq 0 ]
+    do
+        # Thrift server won't be started immediately, so take a nap
+        sleep 2s
+        # Try to connect to Thrift server using beeline 20 times
+        execute_withlog ${SUBMIT_CMD}
+        result=$?
+        count=$((count+1))
+        if [ $count -gt 20 ]; then
+            echo -e "${BRed}ERROR${Color_Off}: Thrift server${BYellow} ${Color_Off} failed to start successfully"
+            break
+        fi
+    done
+    if [ $count -ne 21 ]; then
+        echo -e "${BGreen}Thrift server's been successfully started ${Color_Off}"
+    fi
+}
+
+function run_powertest() {
+    DATABASE_NAME="tpcds_${TABLE_SIZE}g"
+
+    # Test using Thrift server & Beeline are currently supported
+    BEELINE_CMD="${SPARK_HOME}/bin/beeline"
+    BEELINE_GLOBAL_OPTS="-u ${TPCDS_JDBC_URL}/${DATABASE_NAME}"
+
+    START_THRIFTSERVER_CMD="${SPARK_HOME}/sbin/start-thriftserver.sh"
+    STOP_THRIFTSERVER_CMD="${SPARK_HOME}/sbin/stop-thriftserver.sh"
+
+    INCLUDED_LIST=(19 42 43 52 55 63 68 73 98)
+
+    export_withlog SPARKBENCH_PROPERTIES_FILES
+
+    QUERY_BEGIN_NUM=${TPCDS_TEST_LIST:0:2}
+    QUERY_END_NUM=${TPCDS_TEST_LIST: -2}
+    len=${#INCLUDED_LIST[@]}
+
+    YARN_OPTS=""
+    if [[ "$SPARK_MASTER" == yarn-* ]]; then
+        export_withlog HADOOP_CONF_DIR
+
+        YARN_OPTS="--num-executors ${YARN_NUM_EXECUTORS}"
+        if [[ -n "${YARN_EXECUTOR_CORES:-}" ]]; then
+            YARN_OPTS="${YARN_OPTS} --executor-cores ${YARN_EXECUTOR_CORES}"
+       fi
+       if [[ -n "${SPARK_YARN_EXECUTOR_MEMORY:-}" ]]; then
+           YARN_OPTS="${YARN_OPTS} --executor-memory ${SPARK_YARN_EXECUTOR_MEMORY}"
+       fi
+       if [[ -n "${SPAKR_YARN_DRIVER_MEMORY:-}" ]]; then
+           YARN_OPTS="${YARN_OPTS} --driver-memory ${SPARK_YARN_DRIVER_MEMORY}"
+       fi
+    fi
+
+    ensure_thriftserver_started
+
+    echo -e "${BCyan}Running TPC-DS power test ${Color_Off}"
+
+    for (( i=${QUERY_BEGIN_NUM}; i<${QUERY_END_NUM} + 1; i++)); do
+        j=0
+        found=false
+        while [ $j -lt $len ]
+        do
+            if [ "${INCLUDED_LIST[$j]}" == "${i}" ]; then
+                found=true
+                break
+            fi
+            let j++
+        done
+        if [ "${found}" == "false" ]; then
+            continue
+        fi
+
+        export QUERY_NUMBER=${i}
+        export QUERY_NAME=q${QUERY_NUMBER}
+        export QUERY_FILE_NAME="${HIBENCH_HOME}/sparkbench/sql/src/main/resources/tpcds-query/${QUERY_NAME}.sql"
+        export REDUCE_NUM=${NUM_REDS}
+
+        WORKLOAD_RESULT_FOLDER="${HIBENCH_HOME}/report/tpcds/spark/power/${QUERY_NAME}"
+        mkdir -p ${WORKLOAD_RESULT_FOLDER}
+        export WORKLOAD_RESULT_FOLDER
+
+        MONITOR_PID=`start_monitor`
+        SUBMIT_CMD="${BEELINE_CMD} ${BEELINE_GLOBAL_OPTS} -f ${QUERY_FILE_NAME}"
+
+        echo -e "${BGreen}Submit: ${Green}${SUBMIT_CMD}${Color_Off}"
+        execute_withlog ${SUBMIT_CMD}
+        result=$?
+        stop_monitor ${MONITOR_PID}
+
+        if [ $result -ne 0 ]
+        then
+            echo -e "${BRed}ERROR${Color_Off}: TPC-DS power test${BYellow} ${Color_Off} failed to run successfully."
+            echo -e "${BBlue}Hint${Color_Off}: You can goto ${BYellow}${WORKLOAD_RESULT_FOLDER}/bench.log${Color_Off} to check for detailed log.\nOpening log tail for you:\n"
+            tail ${WORKLOAD_RESULT_FOLDER}/bench.log
+            exit $result
+        fi
+        echo -e "${BGreen}finish subquery ${Color_Off}${UGreen}$HIBENCH_CUR_WORKLOAD_NAME ${QUERY_NAME}${Color_Off} ${BGreen} ${Color_Off}"
+    done
+
+    ${STOP_THRIFTSERVER_CMD}
+}
+
+
+function gen_throughputtest_stream() {
+    throughtput_test_resource_dir=${HIBENCH_HOME}/sparkbench/sql/src/main/resources/tpcds-query
+    export throughput_test_bin_dir=${HIBENCH_HOME}/bin/workloads/sql/tpcds/spark
+    ${HIBENCH_HOME}/bin/functions/gen_stream_sql.py ${TPCDS_TEST_LIST} ${throughtput_test_resource_dir} ${throughput_test_bin_dir} ${TPCDS_STREAM_SCALE}
+}
+
+function run_throughputtest() {
+    export DATABASE_NAME="tpcds_${TABLE_SIZE}g"
+
+    START_THRIFTSERVER_CMD="${SPARK_HOME}/sbin/start-thriftserver.sh"
+    STOP_THRIFTSERVER_CMD="${SPARK_HOME}/sbin/stop-thriftserver.sh"
+
+    # we should let the subprocess know these variables
+    export SPARK_MASTER=${SPARK_MASTER}
+    export SPARK_PROP_CONF=${SPARK_PROP_CONF}
+
+    export BEELINE_CMD="${SPARK_HOME}/bin/beeline"
+    export BEELINE_GLOBAL_OPTS="-u ${TPCDS_JDBC_URL}/${DATABASE_NAME}"
+
+    export workload_func_bin=${workload_func_bin}
+    export -f execute_withlog
+
+    export_withlog SPARKBENCH_PROPERTIES_FILES
+
+    YARN_OPTS=""
+    if [[ "$SPARK_MASTER" == yarn-* ]]; then
+        export_withlog HADOOP_CONF_DIR
+
+        YARN_OPTS="--num-executors ${YARN_NUM_EXECUTORS}"
+        if [[ -n "${YARN_EXECUTOR_CORES:-}" ]]; then
+            YARN_OPTS="${YARN_OPTS} --executor-cores ${YARN_EXECUTOR_CORES}"
+       fi
+       if [[ -n "${SPARK_YARN_EXECUTOR_MEMORY:-}" ]]; then
+           YARN_OPTS="${YARN_OPTS} --executor-memory ${SPARK_YARN_EXECUTOR_MEMORY}"
+       fi
+       if [[ -n "${SPAKR_YARN_DRIVER_MEMORY:-}" ]]; then
+           YARN_OPTS="${YARN_OPTS} --driver-memory ${SPARK_YARN_DRIVER_MEMORY}"
+       fi
+    fi
+
+    ensure_thriftserver_started
+
+    echo -e "${BCyan}Running TPC-DS throughput test ${Color_Off}"
+
+    for(( i = 0; i < ${TPCDS_STREAM_SCALE}; i++ ))
+    do
+    {
+        WORKLOAD_RESULT_FOLDER="${HIBENCH_HOME}/report/tpcds/spark/throughput/u${i}"
+        mkdir -p ${WORKLOAD_RESULT_FOLDER}
+        export WORKLOAD_RESULT_FOLDER
+
+        MONITOR_PID=`start_monitor`
+        bash ${throughput_test_bin_dir}/stream${i}.sh
+        result=$?
+        stop_monitor ${MONITOR_PID}
+
+        if [ $result -ne 0 ]
+        then
+            echo -e "${BRed}ERROR${Color_Off}: Spark job ${BYellow}${Color_Off} failed to run successfully."
+            echo -e "${BBlue}Hint${Color_Off}: You can goto ${BYellow}${WORKLOAD_RESULT_FOLDER}/bench.log${Color_Off} to check for detailed log.\nOpening log tail for you:\n"
+            tail ${WORKLOAD_RESULT_FOLDER}/bench.log
+            exit $result
+        fi
+        echo -e "${BGreen}finish query for ${Color_Off}${UGreen}$HIBENCH_CUR_WORKLOAD_NAME stream ${i}${Color_Off} ${BGreen} ${Color_Off}"
+    }&
+    done
+    wait
+
+    ${STOP_THRIFTSERVER_CMD}
+}
+
+function remove_temporaryfiles() {
+    rm ${HIBENCH_HOME}/bin/workloads/sql/tpcds/spark/stream*
+    rm ${HIBENCH_HOME}/sparkbench/sql/src/main/resources/tpcds-query/stream*
+    make -C ${DSDGEN_DIR} clean
 }

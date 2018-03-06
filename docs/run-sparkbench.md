@@ -12,6 +12,8 @@
 
  * Start HDFS, Yarn, Spark in the cluster.
 
+ * Gcc and make are required if you run sql/tpcds module.
+
 
 
 ### 2. Configure `hadoop.conf` ###
