@@ -17,8 +17,7 @@
 
 package com.intel.hibench.sparkbench.sql
 
-import org.apache.spark.{SparkConf, SparkContext}
-import org.apache.spark.sql.hive.HiveContext
+import org.apache.spark.sql.SparkSession
 
 /*
  * ported from HiBench's hive bench
@@ -32,15 +31,16 @@ object ScalaSparkSQLBench{
       System.exit(1)
     }
     val workload_name = args(0)
+    val sparkSession = SparkSession.builder().enableHiveSupport().appName(workload_name).getOrCreate()
+
     val sql_file = args(1)
-    val sparkConf = new SparkConf().setAppName(workload_name)
-    val sc = new SparkContext(sparkConf)
-    val hc = new HiveContext(sc)
+    val sc = sparkSession.sparkContext
+    val sqlContext = sparkSession.sqlContext
 
     val _sql = scala.io.Source.fromFile(sql_file).mkString
     _sql.split(';').foreach { x =>
       if (x.trim.nonEmpty)
-        hc.sql(x)
+        sqlContext.sql(x)
     }
 
     sc.stop()
